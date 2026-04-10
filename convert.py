@@ -282,8 +282,9 @@ class INSVConverter:
             if self.save_depth:
                 self._generate_depth_video(left_tmp, right_tmp, video_info)
 
-            # Fix hardware format issue: vstack output is software yuv420p,
-            # hardware encoders need hardware surfaces.
+            # FIX: When using HW encoders, the vstack output (software) must be explicitly
+            # converted to the HW format surface using hwupload.
+            # We use a more robust filter chain: vstack -> format=nv12 -> hwupload
             hw_filter = ""
             if self.encoder_type == "vaapi":
                 hw_filter = ",format=nv12,hwupload"
@@ -302,8 +303,6 @@ class INSVConverter:
                     "[v]",
                     "-c:v",
                     encoder_name,
-                    "-pix_fmt",
-                    "yuv420p",
                     "-movflags",
                     "+faststart",
                     "-progress",
@@ -333,8 +332,6 @@ class INSVConverter:
                     f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{output_height},setsar=1{hw_filter}",
                     "-c:v",
                     encoder_name,
-                    "-pix_fmt",
-                    "yuv420p",
                     "-movflags",
                     "+faststart",
                     "-progress",
@@ -351,12 +348,20 @@ class INSVConverter:
                 else cmd
             )
 
-        if "nvenc" in encoder_name:
-            cmd.insert(-1, "-cq")
-            cmd.insert(-1, "23")
-        elif "lib" in encoder_name:
-            cmd.insert(-1, "-crf")
-            cmd.insert(-1, "23")
+        # Only add software-specific pix_fmt or crf if not using HW encoders
+        if self.encoder_type == "software":
+            cmd.insert(-1, "-pix_fmt", "yuv420p")
+            if "nvenc" in encoder_name:  # This part is actually for software now
+                pass
+            if "lib" in encoder_name:
+                cmd.insert(-1, "-crf")
+                cmd.insert(-1, "23")
+        else:
+            # HW encoders often prefer their own internal format handling
+            # but some benefit from explicit flags.
+            if "nvenc" in encoder_name:
+                cmd.insert(-1, "-cq")
+                cmd.insert(-1, "23")
 
         self.monitor.start_monitoring()
         process = subprocess.Popen(
