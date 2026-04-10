@@ -129,6 +129,11 @@ class INSVConverter:
             "stream_count": len(video_streams),
         }
 
+    def _check_encoder_support(self, encoder_name: str) -> bool:
+        """Check if the current FFmpeg binary supports the requested encoder"""
+        result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+        return encoder_name in result.stdout
+
     def _inject_vr_metadata(self):
         """Inject YouTube VR metadata using spatial-media tool"""
         if not self.stereo:
@@ -172,7 +177,20 @@ class INSVConverter:
         video_info = self._get_video_info()
         encoder_name = self.ENCODERS[self.encoder_type][self.codec_type]
 
-        # Duration constraint for FFmpeg
+        # Validate encoder support
+        if not self._check_encoder_support(encoder_name):
+            print(
+                f"⚠️  Requested encoder '{encoder_name}' is not supported by the current FFmpeg binary."
+            )
+            if self.encoder_type != "software":
+                print("Falling back to software encoding...")
+                self.encoder_type = "software"
+                encoder_name = self.ENCODERS["software"][self.codec_type]
+            else:
+                raise RuntimeError(
+                    f"Encoder {encoder_name} not found and no fallback available."
+                )
+
         duration_flag = ["-t", str(self.duration)] if self.duration else []
 
         if self.stereo:
@@ -184,8 +202,6 @@ class INSVConverter:
             right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
             def extract_eye(stream_idx, out_path):
-                # Use -t before -i for input limiting or after for output limiting.
-                # Putting it after -i is more common for specific duration.
                 cmd = (
                     ["ffmpeg", "-y", "-i", str(self.input_file)]
                     + duration_flag
@@ -293,9 +309,9 @@ class INSVConverter:
             )
             cleanup_files = []
 
-        # Special handling for VAAPI on AMD
-        if self.encoder_type == "vaapi":
-            # Try to add hardware acceleration flags
+        # Handle VAAPI device if supported (only for non-static builds)
+        if self.encoder_type == "vaapi" and self._check_encoder_support("hevc_vaapi"):
+            # Try to add hardware acceleration flag if we are not using a static build
             cmd = (
                 ["ffmpeg", "-vaapi_device", "/dev/dri/renderD128"] + cmd[1:]
                 if "ffmpeg" in cmd[0]
@@ -314,7 +330,6 @@ class INSVConverter:
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
 
-        # Adjust total frames for progress bar if duration is limited
         total_frames = video_info["total_frames"]
         if self.duration:
             total_frames = int(self.duration * video_info["fps"])
