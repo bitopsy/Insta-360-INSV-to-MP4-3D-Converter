@@ -3,8 +3,8 @@
 This tool converts Insta-360 `.insv` files into a Stereo Top-Bottom (Bottom-Up) equirectangular format suitable for VR headsets and YouTube VR.
 
 ## Features
-- **Stereo 1:1 Bottom-Up**: Converts dual fisheye INSV to a stacked stereo format (Right eye top, Left eye bottom).
-- **Hardware Acceleration**: Uses `hevc_nvenc` if an NVIDIA GPU is detected, otherwise falls back to `libx265`.
+- **Stereo 1:1 Bottom-Up (WIP)**: Converts dual fisheye INSV to a stacked stereo format. *Note: Currently experimental and may have alignment issues.*
+- **Hardware Acceleration**: Supports NVENC, VAAPI, and AMF.
 - **System Monitoring**: Real-time CPU, RAM, and VRAM stats displayed during conversion.
 - **YouTube VR Ready**: Automatically injects spatial media metadata for seamless VR playback on YouTube.
 - **Professional CLI**: Progress tracking via `tqdm`.
