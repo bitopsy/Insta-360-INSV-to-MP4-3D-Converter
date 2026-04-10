@@ -76,6 +76,21 @@ class DepthMapGenerator:
         depth = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return depth
 
+    @staticmethod
+    def apply_depth_shift(
+        frame: np.ndarray, depth: np.ndarray, shift_max: int = 15
+    ) -> np.ndarray:
+        """Shift pixels based on depth map to create the opposite eye (DIBR)"""
+        h, w = frame.shape[:2]
+        # Normalize depth to a shift value
+        shift_map = (depth.astype(np.float32) / 255.0) * shift_max
+
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+        # For right eye, shift pixels to the left
+        new_x = np.clip(x - shift_map, 0, w - 1).astype(np.float32)
+
+        return cv2.remap(frame, new_x, y.astype(np.float32), cv2.INTER_LINEAR)
+
 
 class INSVConverter:
     """Main converter class for INSV to VR format"""
@@ -210,8 +225,6 @@ class INSVConverter:
             eye_res = video_info["height"]
             output_width, output_height = eye_res, eye_res * 2
 
-            # HW Encoder Limit Fix: Many HW encoders have a max height (e.g., 4096 or 4352)
-            # If the stereo height exceeds a safe limit, we scale down both dimensions.
             MAX_HW_HEIGHT = 4096
             if self.encoder_type != "software" and output_height > MAX_HW_HEIGHT:
                 scale_factor = MAX_HW_HEIGHT / output_height
@@ -231,15 +244,15 @@ class INSVConverter:
             left_tmp = self.output_file.with_suffix(".left.tmp.mp4")
             right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
-            def extract_eye(stream_idx, out_path):
-                # Added scale filter to handle HW limits
+            def extract_base_view(out_path):
+                # Always use the FRONT lens (stream 0) for both eyes to avoid front/back split
                 vf = f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,scale={eye_res_scaled}:{eye_res_scaled},setsar=1"
                 cmd = (
                     [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
                     + [
                         "-map",
-                        f"0:v:{stream_idx}",
+                        "0:v:0",
                         "-vf",
                         vf,
                         "-c:v",
@@ -253,50 +266,12 @@ class INSVConverter:
                 )
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-            print("Extracting eyes (Corrected 1:1 VR180)...")
-            if video_info["stream_count"] >= 2:
-                extract_eye(0, left_tmp)
-                extract_eye(1, right_tmp)
-            else:
-                vf_l = f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,scale={eye_res_scaled}:{eye_res_scaled},setsar=1"
-                vf_r = f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,scale={eye_res_scaled}:{eye_res_scaled},setsar=1"
-                subprocess.run(
-                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
-                    + duration_flag
-                    + [
-                        "-vf",
-                        vf_l,
-                        "-c:v",
-                        "libx264",
-                        "-crf",
-                        "18",
-                        "-pix_fmt",
-                        "yuv420p",
-                        str(left_tmp),
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
-                subprocess.run(
-                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
-                    + duration_flag
-                    + [
-                        "-vf",
-                        vf_r,
-                        "-c:v",
-                        "libx264",
-                        "-crf",
-                        "18",
-                        "-pix_fmt",
-                        "yuv420p",
-                        str(right_tmp),
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
+            print("Extracting base view (Front lens)...")
+            extract_base_view(left_tmp)
 
-            if self.save_depth:
-                self._generate_depth_video(left_tmp, right_tmp, video_info)
+            # Generate the right eye by simulating stereo shift from the left eye
+            print("Generating right eye via Synthetic Stereo shift...")
+            self._generate_synthetic_right_eye(left_tmp, right_tmp, video_info)
 
             hw_filter = ""
             if self.encoder_type == "vaapi":
@@ -411,45 +386,68 @@ class INSVConverter:
         self._inject_vr_metadata()
         return True
 
-    def _generate_depth_video(
+    def _generate_synthetic_right_eye(
         self, left_path: Path, right_path: Path, video_info: dict
     ):
-        print("Generating depth map video...")
+        """Generates right eye using a simulated stereo shift from the left eye"""
         cap_l = cv2.VideoCapture(str(left_path))
-        cap_r = cv2.VideoCapture(str(right_path))
         ret, frame = cap_l.read()
         if not ret:
             return
         h, w = frame.shape[:2]
+
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(
-            str(self.depth_output_file),
-            fourcc,
-            video_info["fps"],
-            (w, h),
-            isColor=False,
-        )
+        out_r = cv2.VideoWriter(str(right_path), fourcc, video_info["fps"], (w, h))
+
+        out_d = None
+        if self.save_depth:
+            out_d = cv2.VideoWriter(
+                str(self.depth_output_file),
+                fourcc,
+                video_info["fps"],
+                (w, h),
+                isColor=False,
+            )
+
         frames = 0
         limit = (
             int(self.duration * video_info["fps"])
             if self.duration
             else video_info["total_frames"]
         )
-        pbar = tqdm(total=limit, desc="Depth Map", unit="frame")
+        pbar = tqdm(total=limit, desc="Stereo Synthesis", unit="frame")
+
         while frames < limit:
-            ret_l, frame_l = cap_l.read()
-            ret_r, frame_r = cap_r.read()
-            if not (ret_l and ret_r):
+            ret, frame_l = cap_l.read()
+            if not ret:
                 break
-            depth = DepthMapGenerator.generate_disparity(frame_l, frame_r)
-            out.write(depth)
+
+            # To create a synthetic right eye, we shift the image horizontally.
+            # A constant shift of 10-20 pixels simulates basic interpupillary distance.
+            # We use a gradient depth map to make it look more natural (further objects shift less).
+            depth_map = np.zeros((h, w), dtype=np.uint8)
+            # Simulate depth: center is closer (more shift), edges are further (less shift)
+            # Simple Gaussian-like depth simulation
+            X, Y = np.meshgrid(np.arange(w), np.arange(h))
+            dist_from_center = np.sqrt((X - w / 2) ** 2 + (Y - h / 2) ** 2)
+            depth_map = 255 - np.clip(dist_from_center / (w / 4) * 255, 0, 255).astype(
+                np.uint8
+            )
+
+            frame_r = DepthMapGenerator.apply_depth_shift(frame_l, depth_map)
+            out_r.write(frame_r)
+
+            if out_d:
+                out_d.write(depth_map)
+
             frames += 1
             pbar.update(1)
+
         cap_l.release()
-        cap_r.release()
-        out.release()
+        out_r.release()
+        if out_d:
+            out_d.release()
         pbar.close()
-        print(f"Depth map saved to {self.depth_output_file}")
 
 
 def check_env(ffmpeg_path="ffmpeg"):
