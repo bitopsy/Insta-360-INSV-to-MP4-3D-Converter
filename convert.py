@@ -79,11 +79,13 @@ class INSVConverter:
         stereo: bool,
         encoder: str,
         codec: str,
+        duration: Optional[float] = None,
     ):
         self.input_file = Path(input_file)
         self.stereo = stereo
         self.encoder_type = encoder
         self.codec_type = codec
+        self.duration = duration
         self.monitor = SystemMonitor()
 
         if output_file:
@@ -134,7 +136,6 @@ class INSVConverter:
 
         print("\nInjecting YouTube VR metadata...")
         try:
-            # Look for spatial-media tool in expected location
             spatial_media_path = Path(
                 "/home/al/opencode/spatial-media/spatialmedia/__main__.py"
             )
@@ -159,7 +160,6 @@ class INSVConverter:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            # Answer: Spherical? Yes, Stereo? Yes, Top-Bottom? Yes
             stdout, stderr = process.communicate(input="y\ny\ny\n")
             if process.returncode == 0:
                 print("Successfully injected VR metadata.")
@@ -172,125 +172,136 @@ class INSVConverter:
         video_info = self._get_video_info()
         encoder_name = self.ENCODERS[self.encoder_type][self.codec_type]
 
+        # Duration constraint for FFmpeg
+        duration_flag = ["-t", str(self.duration)] if self.duration else []
+
         if self.stereo:
-            # Stereo 1:1 Bottom-Up (Right Top, Left Bottom)
             eye_res = video_info["height"]
             output_width, output_height = eye_res, eye_res * 2
-
             print(f"Mode: Stereo Bottom-Up | Res: {output_width}x{output_height}")
 
             left_tmp = self.output_file.with_suffix(".left.tmp.mp4")
             right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
             def extract_eye(stream_idx, out_path):
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(self.input_file),
-                    "-map",
-                    f"0:v:{stream_idx}",
-                    "-vf",
-                    f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
-                    "-c:v",
-                    "libx264",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    str(out_path),
-                ]
-                subprocess.run(cmd, capture_output=True, check=True)
+                # Use -t before -i for input limiting or after for output limiting.
+                # Putting it after -i is more common for specific duration.
+                cmd = (
+                    ["ffmpeg", "-y", "-i", str(self.input_file)]
+                    + duration_flag
+                    + [
+                        "-map",
+                        f"0:v:{stream_idx}",
+                        "-vf",
+                        f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                        "-c:v",
+                        "libx264",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        str(out_path),
+                    ]
+                )
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(f"Eye extraction failed: {result.stderr}")
 
             print("Extracting eyes...")
             if video_info["stream_count"] >= 2:
                 extract_eye(0, left_tmp)
                 extract_eye(1, right_tmp)
             else:
-                cmd_l = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(self.input_file),
-                    "-vf",
-                    f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                cmd_l = (
+                    ["ffmpeg", "-y", "-i", str(self.input_file)]
+                    + duration_flag
+                    + [
+                        "-vf",
+                        f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                        "-c:v",
+                        "libx264",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        str(left_tmp),
+                    ]
+                )
+                cmd_r = (
+                    ["ffmpeg", "-y", "-i", str(self.input_file)]
+                    + duration_flag
+                    + [
+                        "-vf",
+                        f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                        "-c:v",
+                        "libx264",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        str(right_tmp),
+                    ]
+                )
+                res_l = subprocess.run(cmd_l, capture_output=True, text=True)
+                res_r = subprocess.run(cmd_r, capture_output=True, text=True)
+                if res_l.returncode != 0:
+                    raise RuntimeError(f"Left eye extraction failed: {res_l.stderr}")
+                if res_r.returncode != 0:
+                    raise RuntimeError(f"Right eye extraction failed: {res_r.stderr}")
+
+            cmd = (
+                ["ffmpeg", "-y", "-i", str(right_tmp), "-i", str(left_tmp)]
+                + duration_flag
+                + [
+                    "-filter_complex",
+                    "[0:v][1:v]vstack=inputs=2[v]",
+                    "-map",
+                    "[v]",
                     "-c:v",
-                    "libx264",
-                    "-crf",
-                    "18",
+                    encoder_name,
                     "-pix_fmt",
                     "yuv420p",
-                    str(left_tmp),
+                    "-movflags",
+                    "+faststart",
+                    "-progress",
+                    "pipe:1",
+                    str(self.output_file),
                 ]
-                cmd_r = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(self.input_file),
-                    "-vf",
-                    f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
-                    "-c:v",
-                    "libx264",
-                    "-crf",
-                    "18",
-                    "-pix_fmt",
-                    "yuv420p",
-                    str(right_tmp),
-                ]
-                subprocess.run(cmd_l, capture_output=True, check=True)
-                subprocess.run(cmd_r, capture_output=True, check=True)
-
-            # Stack: Right Top, Left Bottom
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(right_tmp),
-                "-i",
-                str(left_tmp),
-                "-filter_complex",
-                "[0:v][1:v]vstack=inputs=2[v]",
-                "-map",
-                "[v]",
-                "-c:v",
-                encoder_name,
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-progress",
-                "pipe:1",
-                str(self.output_file),
-            ]
-
-            # Cleanup temporary files after conversion
+            )
             cleanup_files = [left_tmp, right_tmp]
         else:
-            # Mono Equirectangular 2:1
-            output_width = video_info["width"]  # Keep original width
+            output_width = video_info["width"]
             output_height = output_width // 2
             print(f"Mode: Mono Equirectangular | Res: {output_width}x{output_height}")
 
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(self.input_file),
-                "-vf",
-                f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{output_height},setsar=1",
-                "-c:v",
-                encoder_name,
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-progress",
-                "pipe:1",
-                str(self.output_file),
-            ]
+            cmd = (
+                ["ffmpeg", "-y", "-i", str(self.input_file)]
+                + duration_flag
+                + [
+                    "-vf",
+                    f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{output_height},setsar=1",
+                    "-c:v",
+                    encoder_name,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    "-progress",
+                    "pipe:1",
+                    str(self.output_file),
+                ]
+            )
             cleanup_files = []
 
-        # Add encoder presets
+        # Special handling for VAAPI on AMD
+        if self.encoder_type == "vaapi":
+            # Try to add hardware acceleration flags
+            cmd = (
+                ["ffmpeg", "-vaapi_device", "/dev/dri/renderD128"] + cmd[1:]
+                if "ffmpeg" in cmd[0]
+                else cmd
+            )
+
         if "nvenc" in encoder_name:
             cmd.insert(-1, "-cq")
             cmd.insert(-1, "23")
@@ -303,11 +314,19 @@ class INSVConverter:
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
 
-        pbar = tqdm(total=video_info["total_frames"], desc="Processing", unit="frame")
+        # Adjust total frames for progress bar if duration is limited
+        total_frames = video_info["total_frames"]
+        if self.duration:
+            total_frames = int(self.duration * video_info["fps"])
+
+        pbar = tqdm(total=total_frames, desc="Processing", unit="frame")
         last_frame = 0
 
         try:
-            for line in process.stdout:
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
                 if "frame=" in line:
                     try:
                         frame = int(line.split("frame=")[1].split()[0])
@@ -317,7 +336,13 @@ class INSVConverter:
                             pbar.set_postfix_str(self.monitor.get_stats_str())
                     except:
                         pass
-            process.wait()
+
+            if process.returncode != 0:
+                stderr = process.stderr.read()
+                raise RuntimeError(
+                    f"FFmpeg conversion failed with return code {process.returncode}:\n{stderr}"
+                )
+
             pbar.close()
         finally:
             self.monitor.stop_monitoring()
@@ -346,6 +371,12 @@ def main():
     parser.add_argument(
         "--codec", choices=["hevc", "h264"], default="hevc", help="Video codec to use"
     )
+    parser.add_argument(
+        "-d",
+        "--duration",
+        type=float,
+        help="Only convert the first N seconds of the video",
+    )
 
     args = parser.parse_args()
 
@@ -355,15 +386,17 @@ def main():
 
     try:
         converter = INSVConverter(
-            args.input, args.output, args.stereo, args.encoder, args.codec
+            args.input,
+            args.output,
+            args.stereo,
+            args.encoder,
+            args.codec,
+            args.duration,
         )
         if converter.convert():
             print(f"\n🎉 Successfully converted to {converter.output_file}")
     except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-
-        traceback.print_exc()
+        print(f"\n💥 Error: {e}")
         sys.exit(1)
 
 
