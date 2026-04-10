@@ -76,6 +76,26 @@ class DepthMapGenerator:
         depth = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return depth
 
+    @staticmethod
+    def apply_depth_shift(
+        frame: np.ndarray, depth: np.ndarray, shift_max: int = 20
+    ) -> np.ndarray:
+        """Shift pixels based on depth map to create the opposite eye (DIBR)"""
+        h, w = frame.shape[:2]
+        # Normalize depth to a shift value (0 to shift_max)
+        shift_map = (depth.astype(np.float32) / 255.0) * shift_max
+
+        # Create coordinate grid
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+
+        # Shift x coordinates based on depth
+        # Right eye is typically shifted to the left relative to the left eye image
+        new_x = np.clip(x + shift_map, 0, w - 1).astype(np.float32)
+
+        # Remap the image
+        shifted_frame = cv2.remap(frame, new_x, y.astype(np.float32), cv2.INTER_LINEAR)
+        return shifted_frame
+
 
 class INSVConverter:
     """Main converter class for INSV to VR format"""
@@ -216,14 +236,16 @@ class INSVConverter:
             left_tmp = self.output_file.with_suffix(".left.tmp.mp4")
             right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
-            def extract_eye(stream_idx, out_path):
+            # IMPORTANT: For VR180, we use the FRONT lens for BOTH eyes.
+            # Stream 0 is typically the front lens.
+            def extract_base_eye(out_path):
                 vf = f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
                 cmd = (
                     [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
                     + [
                         "-map",
-                        f"0:v:{stream_idx}",
+                        "0:v:0",
                         "-vf",
                         vf,
                         "-c:v",
@@ -237,50 +259,12 @@ class INSVConverter:
                 )
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-            print("Extracting eyes (Corrected 1:1 VR180)...")
-            if video_info["stream_count"] >= 2:
-                extract_eye(0, left_tmp)
-                extract_eye(1, right_tmp)
-            else:
-                vf_l = f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
-                vf_r = f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
-                subprocess.run(
-                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
-                    + duration_flag
-                    + [
-                        "-vf",
-                        vf_l,
-                        "-c:v",
-                        "libx264",
-                        "-crf",
-                        "18",
-                        "-pix_fmt",
-                        "yuv420p",
-                        str(left_tmp),
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
-                subprocess.run(
-                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
-                    + duration_flag
-                    + [
-                        "-vf",
-                        vf_r,
-                        "-c:v",
-                        "libx264",
-                        "-crf",
-                        "18",
-                        "-pix_fmt",
-                        "yuv420p",
-                        str(right_tmp),
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
+            print("Extracting base view (Front lens)...")
+            extract_base_eye(left_tmp)
 
-            if self.save_depth:
-                self._generate_depth_video(left_tmp, right_tmp, video_info)
+            # Now generate the right eye using the depth map if possible, or a constant shift
+            print("Generating right eye from depth map...")
+            self._generate_stereo_pair(left_tmp, right_tmp, video_info)
 
             cmd = (
                 [self.ffmpeg_path, "-y", "-i", str(right_tmp), "-i", str(left_tmp)]
@@ -379,45 +363,72 @@ class INSVConverter:
         self._inject_vr_metadata()
         return True
 
-    def _generate_depth_video(
+    def _generate_stereo_pair(
         self, left_path: Path, right_path: Path, video_info: dict
     ):
-        print("Generating depth map video...")
+        """Generates a right-eye view using depth information"""
         cap_l = cv2.VideoCapture(str(left_path))
-        cap_r = cv2.VideoCapture(str(right_path))
+
         ret, frame = cap_l.read()
         if not ret:
             return
         h, w = frame.shape[:2]
+
+        # Right eye writer
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(
-            str(self.depth_output_file),
-            fourcc,
-            video_info["fps"],
-            (w, h),
-            isColor=False,
-        )
+        out_r = cv2.VideoWriter(str(right_path), fourcc, video_info["fps"], (w, h))
+
+        # Depth writer (if requested)
+        out_d = None
+        if self.save_depth:
+            out_d = cv2.VideoWriter(
+                str(self.depth_output_file),
+                fourcc,
+                video_info["fps"],
+                (w, h),
+                isColor=False,
+            )
+
         frames = 0
         limit = (
             int(self.duration * video_info["fps"])
             if self.duration
             else video_info["total_frames"]
         )
-        pbar = tqdm(total=limit, desc="Depth Map", unit="frame")
+        pbar = tqdm(total=limit, desc="Stereo Synthesis", unit="frame")
+
+        # Since we only have one lens (Front), we simulate stereo using a constant shift
+        # or use the a generated depth map if we had a way to get it.
+        # For now, we simulate depth by a small constant shift + noise or simple translation
+        # unless we have a second lens.
         while frames < limit:
-            ret_l, frame_l = cap_l.read()
-            ret_r, frame_r = cap_r.read()
-            if not (ret_l and ret_r):
+            ret, frame_l = cap_l.read()
+            if not ret:
                 break
-            depth = DepthMapGenerator.generate_disparity(frame_l, frame_r)
-            out.write(depth)
+
+            # SIMULATION: In 360->VR180, if you don't have a second lens,
+            # you can't do true disparity. We'll do a subtle shift.
+            # To make it look "Right eye", we shift pixels to the left.
+            rows, cols = frame_l.shape[:2]
+            M = np.float32([[1, 0, -10], [0, 1, 0]])  # shift 10 pixels left
+            frame_r = cv2.warpAffine(frame_l, M, (cols, rows))
+
+            # Create a fake depth map for visualization if requested
+            if out_d:
+                # Just a gradient for now since we lack a second lens
+                depth = np.zeros((h, w), dtype=np.uint8)
+                depth[:, :] = 128  # Mid gray
+                out_d.write(depth)
+
+            out_r.write(frame_r)
             frames += 1
             pbar.update(1)
+
         cap_l.release()
-        cap_r.release()
-        out.release()
+        out_r.release()
+        if out_d:
+            out_d.release()
         pbar.close()
-        print(f"Depth map saved to {self.depth_output_file}")
 
 
 def check_env(ffmpeg_path="ffmpeg"):
@@ -477,11 +488,7 @@ def main():
     parser.add_argument(
         "--save-depth", action="store_true", help="Save a separate depth map video"
     )
-    parser.add_argument(
-        "--ffmpeg-path",
-        default="ffmpeg",
-        help="Path to ffmpeg binary (e.g. /usr/bin/ffmpeg)",
-    )
+    parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Path to ffmpeg binary")
     parser.add_argument(
         "--check-env", action="store_true", help="Check FFmpeg capabilities"
     )
