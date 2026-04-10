@@ -69,15 +69,10 @@ class DepthMapGenerator:
     def generate_disparity(
         left_frame: np.ndarray, right_frame: np.ndarray
     ) -> np.ndarray:
-        # Convert to grayscale
         gray_l = cv2.cvtColor(left_frame, cv2.COLOR_BGR2GRAY)
         gray_r = cv2.cvtColor(right_frame, cv2.COLOR_BGR2GRAY)
-
-        # StereoBM is fast and effective for basic depth
         stereo = cv2.StereoBM_create(numDisparities=64, blockSize=15)
         disparity = stereo.compute(gray_l, gray_r)
-
-        # Normalize to 0-255 for visualization
         depth = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return depth
 
@@ -101,6 +96,7 @@ class INSVConverter:
         codec: str,
         duration: Optional[float] = None,
         save_depth: bool = False,
+        ffmpeg_path: str = "ffmpeg",
     ):
         self.input_file = Path(input_file)
         self.stereo = stereo
@@ -108,6 +104,12 @@ class INSVConverter:
         self.codec_type = codec
         self.duration = duration
         self.save_depth = save_depth
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = (
+            ffmpeg_path.replace("ffmpeg", "ffprobe")
+            if "ffmpeg" in ffmpeg_path
+            else "ffprobe"
+        )
         self.monitor = SystemMonitor()
 
         if output_file:
@@ -121,7 +123,7 @@ class INSVConverter:
 
     def _get_video_info(self) -> dict:
         cmd = [
-            "ffprobe",
+            self.ffprobe_path,
             "-v",
             "quiet",
             "-print_format",
@@ -156,7 +158,9 @@ class INSVConverter:
         }
 
     def _check_encoder_support(self, encoder_name: str) -> bool:
-        result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+        result = subprocess.run(
+            [self.ffmpeg_path, "-encoders"], capture_output=True, text=True
+        )
         return encoder_name in result.stdout
 
     def _inject_vr_metadata(self):
@@ -194,16 +198,15 @@ class INSVConverter:
         encoder_name = self.ENCODERS[self.encoder_type][self.codec_type]
 
         if not self._check_encoder_support(encoder_name):
-            print(f"⚠️  '{encoder_name}' not supported. Falling back to software...")
+            print(
+                f"⚠️  '{encoder_name}' not supported by {self.ffmpeg_path}. Falling back to software..."
+            )
             self.encoder_type = "software"
             encoder_name = self.ENCODERS["software"][self.codec_type]
 
         duration_flag = ["-t", str(self.duration)] if self.duration else []
 
         if self.stereo:
-            # To achieve a TRUE 1:1 Stereo VR180:
-            # 1. Convert Fisheye to Equirectangular (2:1)
-            # 2. Crop the center 180 degrees (resulting in 1:1 square)
             eye_res = video_info["height"]
             output_width, output_height = eye_res, eye_res * 2
             print(
@@ -214,11 +217,9 @@ class INSVConverter:
             right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
             def extract_eye(stream_idx, out_path):
-                # v360: fisheye -> equirect (2:1), then crop the center half (1:1)
-                # Crop: width=ih, height=ih, x=(iw-ih)/2, y=0
                 vf = f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
                 cmd = (
-                    ["ffmpeg", "-y", "-i", str(self.input_file)]
+                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
                     + [
                         "-map",
@@ -241,11 +242,10 @@ class INSVConverter:
                 extract_eye(0, left_tmp)
                 extract_eye(1, right_tmp)
             else:
-                # Single stream SBS
                 vf_l = f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
                 vf_r = f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
                 subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(self.input_file)]
+                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
                     + [
                         "-vf",
@@ -262,7 +262,7 @@ class INSVConverter:
                     check=True,
                 )
                 subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(self.input_file)]
+                    [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
                     + [
                         "-vf",
@@ -279,12 +279,11 @@ class INSVConverter:
                     check=True,
                 )
 
-            # Generate Depth Map if requested
             if self.save_depth:
                 self._generate_depth_video(left_tmp, right_tmp, video_info)
 
             cmd = (
-                ["ffmpeg", "-y", "-i", str(right_tmp), "-i", str(left_tmp)]
+                [self.ffmpeg_path, "-y", "-i", str(right_tmp), "-i", str(left_tmp)]
                 + duration_flag
                 + [
                     "-filter_complex",
@@ -308,7 +307,7 @@ class INSVConverter:
             output_height = output_width // 2
             print(f"Mode: Mono Equirectangular | Res: {output_width}x{output_height}")
             cmd = (
-                ["ffmpeg", "-y", "-i", str(self.input_file)]
+                [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                 + duration_flag
                 + [
                     "-vf",
@@ -325,6 +324,13 @@ class INSVConverter:
                 ]
             )
             cleanup_files = []
+
+        if self.encoder_type == "vaapi":
+            cmd = (
+                [self.ffmpeg_path, "-vaapi_device", "/dev/dri/renderD128"] + cmd[1:]
+                if "ffmpeg" in self.ffmpeg_path or self.ffmpeg_path == "ffmpeg"
+                else cmd
+            )
 
         if "nvenc" in encoder_name:
             cmd.insert(-1, "-cq")
@@ -379,13 +385,10 @@ class INSVConverter:
         print("Generating depth map video...")
         cap_l = cv2.VideoCapture(str(left_path))
         cap_r = cv2.VideoCapture(str(right_path))
-
-        # Get frame size from first read
         ret, frame = cap_l.read()
         if not ret:
             return
         h, w = frame.shape[:2]
-
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(
             str(self.depth_output_file),
@@ -394,26 +397,22 @@ class INSVConverter:
             (w, h),
             isColor=False,
         )
-
         frames = 0
         limit = (
             int(self.duration * video_info["fps"])
             if self.duration
             else video_info["total_frames"]
         )
-
         pbar = tqdm(total=limit, desc="Depth Map", unit="frame")
         while frames < limit:
             ret_l, frame_l = cap_l.read()
             ret_r, frame_r = cap_r.read()
             if not (ret_l and ret_r):
                 break
-
             depth = DepthMapGenerator.generate_disparity(frame_l, frame_r)
             out.write(depth)
             frames += 1
             pbar.update(1)
-
         cap_l.release()
         cap_r.release()
         out.release()
@@ -421,21 +420,20 @@ class INSVConverter:
         print(f"Depth map saved to {self.depth_output_file}")
 
 
-def check_env():
+def check_env(ffmpeg_path="ffmpeg"):
     """Analyze FFmpeg capabilities and recommend encoder"""
-    print("--- FFmpeg Environment Check ---")
+    print(f"--- FFmpeg Environment Check ({ffmpeg_path}) ---")
     try:
         enc_res = subprocess.run(
-            ["ffmpeg", "-encoders"], capture_output=True, text=True
+            [ffmpeg_path, "-encoders"], capture_output=True, text=True
         )
-        fil_res = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
-
+        fil_res = subprocess.run(
+            [ffmpeg_path, "-filters"], capture_output=True, text=True
+        )
         encoders = enc_res.stdout
         filters = fil_res.stdout
-
         has_v360 = "v360" in filters
         print(f"v360 filter support: {'✅' if has_v360 else '❌'}")
-
         supported = []
         checks = {
             "NVENC (Nvidia)": "hevc_nvenc",
@@ -443,34 +441,23 @@ def check_env():
             "AMF (AMD)": "hevc_amf",
             "Software (CPU)": "libx265",
         }
-
         for name, enc in checks.items():
             if enc in encoders:
                 supported.append(name)
                 print(f"{name}: ✅")
             else:
                 print(f"{name}: ❌")
-
         print("\n--- Recommendation ---")
         if "NVENC (Nvidia)" in supported:
-            print(
-                "Recommendation: Use '--encoder nvenc' for fastest high-quality encoding."
-            )
+            print("Recommendation: Use '--encoder nvenc'")
         elif "VAAPI (Intel/AMD)" in supported:
-            print(
-                "Recommendation: Use '--encoder vaapi' for hardware acceleration on Intel/AMD."
-            )
+            print("Recommendation: Use '--encoder vaapi'")
         elif "AMF (AMD)" in supported:
-            print(
-                "Recommendation: Use '--encoder amf' for hardware acceleration on AMD."
-            )
+            print("Recommendation: Use '--encoder amf'")
         else:
-            print(
-                "Recommendation: Use '--encoder software'. No hardware encoders detected."
-            )
-
+            print("Recommendation: Use '--encoder software'")
     except FileNotFoundError:
-        print("Error: FFmpeg not found in PATH.")
+        print(f"Error: FFmpeg not found at {ffmpeg_path}")
 
 
 def main():
@@ -491,25 +478,24 @@ def main():
         "--save-depth", action="store_true", help="Save a separate depth map video"
     )
     parser.add_argument(
-        "--check-env",
-        action="store_true",
-        help="Check FFmpeg capabilities and recommend encoder",
+        "--ffmpeg-path",
+        default="ffmpeg",
+        help="Path to ffmpeg binary (e.g. /usr/bin/ffmpeg)",
+    )
+    parser.add_argument(
+        "--check-env", action="store_true", help="Check FFmpeg capabilities"
     )
 
     args = parser.parse_args()
-
     if args.check_env:
-        check_env()
+        check_env(args.ffmpeg_path)
         sys.exit(0)
-
     if not args.input:
         parser.print_help()
         sys.exit(1)
-
     if not os.path.exists(args.input):
         print(f"Input file not found: {args.input}")
         sys.exit(1)
-
     try:
         converter = INSVConverter(
             args.input,
@@ -519,6 +505,7 @@ def main():
             args.codec,
             args.duration,
             args.save_depth,
+            args.ffmpeg_path,
         )
         if converter.convert():
             print(f"\n🎉 Successfully converted to {converter.output_file}")
