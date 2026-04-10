@@ -66,7 +66,7 @@ class DepthMapGenerator:
     """Generate disparity-based depth maps for stereo 3D"""
 
     @staticmethod
-    def generate_disparity_cv2(
+    def generate_disparity(
         left_frame: np.ndarray, right_frame: np.ndarray
     ) -> np.ndarray:
         gray_l = cv2.cvtColor(left_frame, cv2.COLOR_BGR2GRAY)
@@ -75,48 +75,6 @@ class DepthMapGenerator:
         disparity = stereo.compute(gray_l, gray_r)
         depth = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return depth
-
-    @staticmethod
-    def generate_disparity_gmic(
-        left_frame: np.ndarray, right_frame: np.ndarray, gmic_path: str = "gmic"
-    ) -> np.ndarray:
-        """Generate depth map using G'MIC stereo_depth"""
-        # G'MIC requires files as input. We use temporary files.
-        temp_l = Path("temp_l.png")
-        temp_r = Path("temp_r.png")
-        temp_d = Path("temp_d.png")
-
-        cv2.imwrite(str(temp_l), left_frame)
-        cv2.imwrite(str(temp_r), right_frame)
-
-        try:
-            # gmic input1 input2 -stereo_depth [disparity_range] -o output
-            # Parameters for stereo_depth: disparity range, etc.
-            # We use a reasonable default for VR180.
-            cmd = [
-                gmic_path,
-                str(temp_l),
-                str(temp_r),
-                "-stereo_depth",
-                "64,15",
-                "-o",
-                str(temp_d),
-            ]
-            subprocess.run(cmd, capture_output=True, check=True)
-
-            depth = cv2.imread(str(temp_d), cv2.IMREAD_GRAYSCALE)
-            if depth is None:
-                raise RuntimeError("G'MIC failed to produce a depth map output.")
-
-            # Ensure it's 8-bit normalized
-            depth = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            return depth
-        except Exception as e:
-            raise RuntimeError(f"G'MIC depth calculation failed: {e}")
-        finally:
-            for f in [temp_l, temp_r, temp_d]:
-                if f.exists():
-                    f.unlink()
 
     @staticmethod
     def apply_depth_shift(
@@ -378,15 +336,14 @@ class INSVConverter:
                 else cmd
             )
 
+        # FIXED: Corrected list insertion for software parameters
         if self.encoder_type == "software":
-            cmd.insert(-1, "-pix_fmt", "yuv420p")
+            cmd.extend(["-pix_fmt", "yuv420p"])
             if "lib" in encoder_name:
-                cmd.insert(-1, "-crf")
-                cmd.insert(-1, "23")
+                cmd.extend(["-crf", "23"])
         else:
             if "nvenc" in encoder_name:
-                cmd.insert(-1, "-cq")
-                cmd.insert(-1, "23")
+                cmd.extend(["-cq", "23"])
 
         self.monitor.start_monitoring()
         process = subprocess.Popen(
@@ -431,7 +388,7 @@ class INSVConverter:
     def _generate_synthetic_right_eye(
         self, left_path: Path, right_path: Path, video_info: dict
     ):
-        """Generates right eye using specified depth method"""
+        """Generates right eye using a simulated stereo shift from the left eye"""
         cap_l = cv2.VideoCapture(str(left_path))
         ret, frame = cap_l.read()
         if not ret:
@@ -464,29 +421,15 @@ class INSVConverter:
             if not ret:
                 break
 
-            # Synthetic depth generation for the right eye shift
-            if self.depth_method == "gmic":
-                # Note: This is slow as it requires disk I/O per frame.
-                # We'll use a fallback if gmic is not installed.
-                try:
-                    # Since we don't have a second lens, G'MIC cannot do real stereo_depth.
-                    # We will simulate a depth map for the shift.
-                    depth_map = np.zeros((h, w), dtype=np.uint8)
-                    X, Y = np.meshgrid(np.arange(w), np.arange(h))
-                    dist_from_center = np.sqrt((X - w / 2) ** 2 + (Y - h / 2) ** 2)
-                    depth_map = 255 - np.clip(
-                        dist_from_center / (w / 4) * 255, 0, 255
-                    ).astype(np.uint8)
-                except:
-                    depth_map = np.zeros((h, w), dtype=np.uint8)
-            else:
-                # CV2 / Default simulation
-                depth_map = np.zeros((h, w), dtype=np.uint8)
-                X, Y = np.meshgrid(np.arange(w), np.arange(h))
-                dist_from_center = np.sqrt((X - w / 2) ** 2 + (Y - h / 2) ** 2)
-                depth_map = 255 - np.clip(
-                    dist_from_center / (w / 4) * 255, 0, 255
-                ).astype(np.uint8)
+            # We use a basic center-weighted depth simulation to make the Right eye shift.
+            # Since we have only one lens, G'MIC cannot calculate real disparity.
+            # We generate a a simulated depth map where the center is closer.
+            depth_map = np.zeros((h, w), dtype=np.uint8)
+            X, Y = np.meshgrid(np.arange(w), np.arange(h))
+            dist_from_center = np.sqrt((X - w / 2) ** 2 + (Y - h / 2) ** 2)
+            depth_map = 255 - np.clip(dist_from_center / (w / 4) * 255, 0, 255).astype(
+                np.uint8
+            )
 
             frame_r = DepthMapGenerator.apply_depth_shift(frame_l, depth_map)
             out_r.write(frame_r)
