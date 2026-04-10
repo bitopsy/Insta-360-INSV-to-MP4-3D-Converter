@@ -77,6 +77,61 @@ class DepthMapGenerator:
         return depth
 
     @staticmethod
+    def generate_heuristic_depth(frame: np.ndarray) -> np.ndarray:
+        """Generate depth map based on texture/edge density (heuristic)"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Calculate gradient magnitude (edges = high freq = usually closer)
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        mag = np.sqrt(grad_x**2 + grad_y**2)
+
+        # Normalize and smooth
+        depth = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        # Morphological closing to fill holes in the depth map
+        kernel = np.ones((5, 5), np.uint8)
+        depth = cv2.morphologyEx(depth, cv2.MORPH_CLOSE, kernel)
+        depth = cv2.GaussianBlur(depth, (15, 15), 0)
+
+        return depth
+
+    @staticmethod
+    def apply_gmic_refinement(depth: np.ndarray, gmic_path: str = "gmic") -> np.ndarray:
+        """Refine depth map using G'MIC edge-preserving smoothing"""
+        temp_in = Path("temp_depth_in.png")
+        temp_out = Path("temp_depth_out.png")
+
+        cv2.imwrite(str(temp_in), depth)
+
+        try:
+            # G'MIC filter for edge-preserving smoothing:
+            # -blur_anisotropic [sigma_s, sigma_r]
+            cmd = [
+                gmic_path,
+                str(temp_in),
+                "-blur_anisotropic",
+                "5,10",
+                "-o",
+                str(temp_out),
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+
+            refined = cv2.imread(str(temp_out), cv2.IMREAD_GRAYSCALE)
+            if refined is None:
+                return depth
+            return cv2.normalize(refined, None, 0, 255, cv2.NORM_MINMAX).astype(
+                np.uint8
+            )
+        except Exception as e:
+            print(f"G'MIC refinement failed: {e}")
+            return depth
+        finally:
+            for f in [temp_in, temp_out]:
+                if f.exists():
+                    f.unlink()
+
+    @staticmethod
     def apply_depth_shift(
         frame: np.ndarray, depth: np.ndarray, shift_max: int = 15
     ) -> np.ndarray:
@@ -336,7 +391,6 @@ class INSVConverter:
                 else cmd
             )
 
-        # FIXED: Corrected list insertion for software parameters
         if self.encoder_type == "software":
             cmd.extend(["-pix_fmt", "yuv420p"])
             if "lib" in encoder_name:
@@ -388,7 +442,7 @@ class INSVConverter:
     def _generate_synthetic_right_eye(
         self, left_path: Path, right_path: Path, video_info: dict
     ):
-        """Generates right eye using a simulated stereo shift from the left eye"""
+        """Generates right eye using specified depth method"""
         cap_l = cv2.VideoCapture(str(left_path))
         ret, frame = cap_l.read()
         if not ret:
@@ -421,15 +475,22 @@ class INSVConverter:
             if not ret:
                 break
 
-            # We use a basic center-weighted depth simulation to make the Right eye shift.
-            # Since we have only one lens, G'MIC cannot calculate real disparity.
-            # We generate a a simulated depth map where the center is closer.
-            depth_map = np.zeros((h, w), dtype=np.uint8)
-            X, Y = np.meshgrid(np.arange(w), np.arange(h))
-            dist_from_center = np.sqrt((X - w / 2) ** 2 + (Y - h / 2) ** 2)
-            depth_map = 255 - np.clip(dist_from_center / (w / 4) * 255, 0, 255).astype(
-                np.uint8
-            )
+            # Select depth generation method
+            if self.depth_method == "heuristic":
+                depth_map = DepthMapGenerator.generate_heuristic_depth(frame_l)
+            elif self.depth_method == "gmic":
+                # Start with heuristic, then refine with G'MIC
+                base_depth = DepthMapGenerator.generate_heuristic_depth(frame_l)
+                depth_map = DepthMapGenerator.apply_gmic_refinement(
+                    base_depth, self.gmic_path
+                )
+            else:  # 'cv2' / Simulated
+                depth_map = np.zeros((h, w), dtype=np.uint8)
+                X, Y = np.meshgrid(np.arange(w), np.arange(h))
+                dist_from_center = np.sqrt((X - w / 2) ** 2 + (Y - h / 2) ** 2)
+                depth_map = 255 - np.clip(
+                    dist_from_center / (w / 4) * 255, 0, 255
+                ).astype(np.uint8)
 
             frame_r = DepthMapGenerator.apply_depth_shift(frame_l, depth_map)
             out_r.write(frame_r)
@@ -507,7 +568,7 @@ def main():
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Path to ffmpeg binary")
     parser.add_argument(
         "--depth-method",
-        choices=["cv2", "gmic"],
+        choices=["cv2", "gmic", "heuristic"],
         default="cv2",
         help="Method for depth calculation",
     )
