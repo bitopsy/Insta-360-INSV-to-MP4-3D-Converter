@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Insta-360 INSV to Stereo VR Converter
-Converts spherical INSV format to Stereo Top-Bottom (Bottom-Up) format with YouTube VR metadata.
+Insta-360 INSV to VR Converter
+Professional CLI for converting INSV to VR formats (Mono/Stereo) with HW acceleration.
 """
 
 import os
@@ -62,39 +62,34 @@ class SystemMonitor:
         return f"CPU: {s['cpu']:.1f}% | RAM: {s['memory']:.1f}% | VRAM: {s['vram']:.1f}% ({s['vram_mb']:.0f}MB)"
 
 
-class DepthMapGenerator:
-    """Generate estimated depth maps for stereo 3D conversion"""
-
-    @staticmethod
-    def generate_stereo_depth(
-        left_frame: np.ndarray, right_frame: np.ndarray
-    ) -> np.ndarray:
-        gray_left = cv2.cvtColor(left_frame, cv2.COLOR_BGR2GRAY)
-        gray_right = cv2.cvtColor(right_frame, cv2.COLOR_BGR2GRAY)
-        stereo = cv2.StereoBM_create(numDisparities=96, blockSize=21)
-        disparity = stereo.compute(gray_left, gray_right)
-        depth_map = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX).astype(
-            np.uint8
-        )
-        depth_map = cv2.medianBlur(depth_map, 5)
-        return depth_map
-
-
 class INSVConverter:
-    """Main converter class for INSV to Stereo VR format"""
+    """Main converter class for INSV to VR format"""
 
-    def __init__(self, input_file: str, output_file: str):
+    ENCODERS = {
+        "nvenc": {"hevc": "hevc_nvenc", "h264": "h264_nvenc"},
+        "vaapi": {"hevc": "hevc_vaapi", "h264": "h264_vaapi"},
+        "amf": {"hevc": "hevc_amf", "h264": "h264_amf"},
+        "software": {"hevc": "libx265", "h264": "libx264"},
+    }
+
+    def __init__(
+        self,
+        input_file: str,
+        output_file: Optional[str],
+        stereo: bool,
+        encoder: str,
+        codec: str,
+    ):
         self.input_file = Path(input_file)
-        self.output_file = Path(output_file)
+        self.stereo = stereo
+        self.encoder_type = encoder
+        self.codec_type = codec
         self.monitor = SystemMonitor()
-        self.depth_generator = DepthMapGenerator()
-        self.cuda_available = self._check_cuda_support()
 
-    def _check_cuda_support(self) -> bool:
-        try:
-            return subprocess.run(["nvidia-smi"], capture_output=True).returncode == 0
-        except:
-            return False
+        if output_file:
+            self.output_file = Path(output_file)
+        else:
+            self.output_file = self.input_file.with_suffix(".mp4")
 
     def _get_video_info(self) -> dict:
         cmd = [
@@ -134,9 +129,12 @@ class INSVConverter:
 
     def _inject_vr_metadata(self):
         """Inject YouTube VR metadata using spatial-media tool"""
-        print("Injecting YouTube VR metadata...")
+        if not self.stereo:
+            return
+
+        print("\nInjecting YouTube VR metadata...")
         try:
-            # Path to the cloned spatial-media repo
+            # Look for spatial-media tool in expected location
             spatial_media_path = Path(
                 "/home/al/opencode/spatial-media/spatialmedia/__main__.py"
             )
@@ -144,24 +142,16 @@ class INSVConverter:
                 print("Spatial-media tool not found, skipping injection.")
                 return
 
-            # Command to inject metadata: python3 spatialmedia/__main__.py inject <file>
-            # We need to specify it's stereo and spherical
+            if not self.output_file.exists():
+                print(f"Output file {self.output_file} not found, skipping injection.")
+                return
+
             cmd = [
                 sys.executable,
                 str(spatial_media_path),
                 "inject",
                 str(self.output_file),
             ]
-            # Note: spatial-media usually asks for input or has flags.
-            # The CLI for spatial-media inject is: python spatialmedia/__main__.py inject <file>
-            # It then asks for projection and layout. We can't easily interact.
-            # However, we can try to use the metadata_utils if we want to be programmatic.
-            # For simplicity, we'll try the command and see.
-            # To automate, we can pipe the answers.
-            # 1. Spherical? Yes
-            # 2. Stereo? Yes
-            # 3. Top-Bottom? Yes
-
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -169,6 +159,7 @@ class INSVConverter:
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            # Answer: Spherical? Yes, Stereo? Yes, Top-Bottom? Yes
             stdout, stderr = process.communicate(input="y\ny\ny\n")
             if process.returncode == 0:
                 print("Successfully injected VR metadata.")
@@ -179,130 +170,147 @@ class INSVConverter:
 
     def convert(self):
         video_info = self._get_video_info()
-        # Stereo 1:1 Bottom-Up means:
-        # - Aspect ratio per eye: 1:1
-        # - Layout: Right Eye TOP, Left Eye BOTTOM (Bottom-Up)
-        # - Final resolution: Width x (Height * 2) where Width == Height
+        encoder_name = self.ENCODERS[self.encoder_type][self.codec_type]
 
-        eye_res = video_info["height"]  # Use height as base for 1:1
-        output_width = eye_res
-        output_height = eye_res * 2
+        if self.stereo:
+            # Stereo 1:1 Bottom-Up (Right Top, Left Bottom)
+            eye_res = video_info["height"]
+            output_width, output_height = eye_res, eye_res * 2
 
-        print(
-            f"Target Resolution: {output_width}x{output_height} (Stereo 1:1 Bottom-Up)"
-        )
+            print(f"Mode: Stereo Bottom-Up | Res: {output_width}x{output_height}")
 
-        # 1. Handle dual fisheye to 1:1 Equirectangular per eye
-        # We'll create two temporary files for the eyes
-        left_eye_tmp = self.output_file.with_suffix(".left.tmp.mp4")
-        right_eye_tmp = self.output_file.with_suffix(".right.tmp.mp4")
+            left_tmp = self.output_file.with_suffix(".left.tmp.mp4")
+            right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
-        def extract_eye(stream_idx, out_path):
+            def extract_eye(stream_idx, out_path):
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(self.input_file),
+                    "-map",
+                    f"0:v:{stream_idx}",
+                    "-vf",
+                    f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(out_path),
+                ]
+                subprocess.run(cmd, capture_output=True, check=True)
+
+            print("Extracting eyes...")
+            if video_info["stream_count"] >= 2:
+                extract_eye(0, left_tmp)
+                extract_eye(1, right_tmp)
+            else:
+                cmd_l = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(self.input_file),
+                    "-vf",
+                    f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(left_tmp),
+                ]
+                cmd_r = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(self.input_file),
+                    "-vf",
+                    f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(right_tmp),
+                ]
+                subprocess.run(cmd_l, capture_output=True, check=True)
+                subprocess.run(cmd_r, capture_output=True, check=True)
+
+            # Stack: Right Top, Left Bottom
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(right_tmp),
+                "-i",
+                str(left_tmp),
+                "-filter_complex",
+                "[0:v][1:v]vstack=inputs=2[v]",
+                "-map",
+                "[v]",
+                "-c:v",
+                encoder_name,
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                str(self.output_file),
+            ]
+
+            # Cleanup temporary files after conversion
+            cleanup_files = [left_tmp, right_tmp]
+        else:
+            # Mono Equirectangular 2:1
+            output_width = video_info["width"]  # Keep original width
+            output_height = output_width // 2
+            print(f"Mode: Mono Equirectangular | Res: {output_width}x{output_height}")
+
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-i",
                 str(self.input_file),
-                "-map",
-                f"0:v:{stream_idx}",
                 "-vf",
-                f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
+                f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{output_height},setsar=1",
                 "-c:v",
-                "libx264",
-                "-crf",
-                "18",
+                encoder_name,
                 "-pix_fmt",
                 "yuv420p",
-                str(out_path),
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                str(self.output_file),
             ]
-            subprocess.run(cmd, capture_output=True, check=True)
+            cleanup_files = []
 
-        print("Extracting eyes...")
-        if video_info["stream_count"] >= 2:
-            extract_eye(0, left_eye_tmp)
-            extract_eye(1, right_eye_tmp)
-        else:
-            # Single stream side-by-side
-            cmd_l = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(self.input_file),
-                "-vf",
-                f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                str(left_eye_tmp),
-            ]
-            cmd_r = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(self.input_file),
-                "-vf",
-                f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,scale={output_width}:{eye_res},setsar=1",
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                str(right_eye_tmp),
-            ]
-            subprocess.run(cmd_l, capture_output=True, check=True)
-            subprocess.run(cmd_r, capture_output=True, check=True)
+        # Add encoder presets
+        if "nvenc" in encoder_name:
+            cmd.insert(-1, "-cq")
+            cmd.insert(-1, "23")
+        elif "lib" in encoder_name:
+            cmd.insert(-1, "-crf")
+            cmd.insert(-1, "23")
 
-        # 2. Stack them: Right Eye Top, Left Eye Bottom (Bottom-Up)
-        print("Stacking eyes (Bottom-Up)...")
-        # vstack: [right][left]
-        stack_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(right_eye_tmp),
-            "-i",
-            str(left_eye_tmp),
-            "-filter_complex",
-            "[0:v][1:v]vstack=inputs=2[v]",
-            "-map",
-            "[v]",
-            "-c:v",
-            "hevc_nvenc" if self.cuda_available else "libx265",
-            "-preset",
-            "medium",
-            "-crf",
-            "23" if not self.cuda_available else "-cq",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(self.output_file),
-        ]
-
-        # For progress bar, we'll run FFmpeg and parse output
         self.monitor.start_monitoring()
         process = subprocess.Popen(
-            stack_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
 
-        pbar = tqdm(total=video_info["total_frames"], desc="Converting", unit="frame")
+        pbar = tqdm(total=video_info["total_frames"], desc="Processing", unit="frame")
         last_frame = 0
 
         try:
             for line in process.stdout:
                 if "frame=" in line:
                     try:
-                        # Extract frame number from "frame=  123"
-                        parts = line.split("frame=")[1].split()
-                        frame = int(parts[0])
+                        frame = int(line.split("frame=")[1].split()[0])
                         if frame > last_frame:
                             pbar.update(frame - last_frame)
                             last_frame = frame
@@ -313,23 +321,32 @@ class INSVConverter:
             pbar.close()
         finally:
             self.monitor.stop_monitoring()
+            for f in cleanup_files:
+                f.unlink(missing_ok=True)
 
-        # Cleanup
-        left_eye_tmp.unlink(missing_ok=True)
-        right_eye_tmp.unlink(missing_ok=True)
-
-        # 3. Inject VR Metadata
         self._inject_vr_metadata()
-
         return True
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="INSV to Stereo VR 1:1 Bottom-Up Converter"
-    )
+    parser = argparse.ArgumentParser(description="Insta-360 INSV to VR Converter")
     parser.add_argument("input", help="Input INSV file")
-    parser.add_argument("output", help="Output MP4 file")
+    parser.add_argument(
+        "-o", "--output", help="Output MP4 file (default: input_name.mp4)"
+    )
+    parser.add_argument(
+        "--stereo", action="store_true", help="Enable stereo 1:1 Bottom-Up conversion"
+    )
+    parser.add_argument(
+        "--encoder",
+        choices=["nvenc", "vaapi", "amf", "software"],
+        default="software",
+        help="Hardware encoder to use",
+    )
+    parser.add_argument(
+        "--codec", choices=["hevc", "h264"], default="hevc", help="Video codec to use"
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -337,11 +354,16 @@ def main():
         sys.exit(1)
 
     try:
-        converter = INSVConverter(args.input, args.output)
+        converter = INSVConverter(
+            args.input, args.output, args.stereo, args.encoder, args.codec
+        )
         if converter.convert():
-            print(f"\n🎉 Successfully converted to {args.output}")
+            print(f"\n🎉 Successfully converted to {converter.output_file}")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+
+        traceback.print_exc()
         sys.exit(1)
 
 
