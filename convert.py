@@ -209,6 +209,21 @@ class INSVConverter:
         if self.stereo:
             eye_res = video_info["height"]
             output_width, output_height = eye_res, eye_res * 2
+
+            # HW Encoder Limit Fix: Many HW encoders have a max height (e.g., 4096 or 4352)
+            # If the stereo height exceeds a safe limit, we scale down both dimensions.
+            MAX_HW_HEIGHT = 4096
+            if self.encoder_type != "software" and output_height > MAX_HW_HEIGHT:
+                scale_factor = MAX_HW_HEIGHT / output_height
+                output_height = MAX_HW_HEIGHT
+                output_width = int(eye_res * scale_factor)
+                eye_res_scaled = output_width
+                print(
+                    f"⚠️  Resolution {output_width * 2}x{output_height} exceeds HW limit. Scaling to {output_width}x{output_height}"
+                )
+            else:
+                eye_res_scaled = eye_res
+
             print(
                 f"Mode: Stereo VR180 (1:1) Bottom-Up | Res: {output_width}x{output_height}"
             )
@@ -217,7 +232,8 @@ class INSVConverter:
             right_tmp = self.output_file.with_suffix(".right.tmp.mp4")
 
             def extract_eye(stream_idx, out_path):
-                vf = f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
+                # Added scale filter to handle HW limits
+                vf = f"v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,scale={eye_res_scaled}:{eye_res_scaled},setsar=1"
                 cmd = (
                     [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
@@ -242,8 +258,8 @@ class INSVConverter:
                 extract_eye(0, left_tmp)
                 extract_eye(1, right_tmp)
             else:
-                vf_l = f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
-                vf_r = f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,setsar=1"
+                vf_l = f"crop=iw/2:ih:0:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,scale={eye_res_scaled}:{eye_res_scaled},setsar=1"
+                vf_r = f"crop=iw/2:ih:iw/2:0,v360=fisheye:equirect:ih_fov=200:iv_fov=200,crop=ih:ih:(iw-ih)/2:0,scale={eye_res_scaled}:{eye_res_scaled},setsar=1"
                 subprocess.run(
                     [self.ffmpeg_path, "-y", "-i", str(self.input_file)]
                     + duration_flag
@@ -282,9 +298,6 @@ class INSVConverter:
             if self.save_depth:
                 self._generate_depth_video(left_tmp, right_tmp, video_info)
 
-            # FIX: When using HW encoders, the vstack output (software) must be explicitly
-            # converted to the HW format surface using hwupload.
-            # We use a more robust filter chain: vstack -> format=nv12 -> hwupload
             hw_filter = ""
             if self.encoder_type == "vaapi":
                 hw_filter = ",format=nv12,hwupload"
@@ -348,17 +361,12 @@ class INSVConverter:
                 else cmd
             )
 
-        # Only add software-specific pix_fmt or crf if not using HW encoders
         if self.encoder_type == "software":
             cmd.insert(-1, "-pix_fmt", "yuv420p")
-            if "nvenc" in encoder_name:  # This part is actually for software now
-                pass
             if "lib" in encoder_name:
                 cmd.insert(-1, "-crf")
                 cmd.insert(-1, "23")
         else:
-            # HW encoders often prefer their own internal format handling
-            # but some benefit from explicit flags.
             if "nvenc" in encoder_name:
                 cmd.insert(-1, "-cq")
                 cmd.insert(-1, "23")
