@@ -11,6 +11,7 @@ import threading
 import subprocess
 import argparse
 import json
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple, List
 import psutil
@@ -234,34 +235,26 @@ class INSVConverter:
         return encoder_name in result.stdout
 
     def _inject_vr_metadata(self):
-        if not self.stereo:
-            return
-        print("\nInjecting YouTube VR metadata...")
+        """Inject YouTube VR metadata using spatialmedia package for mono and stereo."""
+        from spatialmedia import metadata_utils
+
+        stereo_mode = "top_bottom" if self.stereo else None
+        print(f"\nInjecting YouTube VR metadata ({stereo_mode or 'mono'})...")
         try:
-            spatial_media_path = Path(
-                "/home/al/opencode/spatial-media/spatialmedia/__main__.py"
+            metadata = metadata_utils.Metadata(
+                projection="equirectangular", stereo_mode=stereo_mode
             )
-            if not spatial_media_path.exists() or not self.output_file.exists():
-                print("Metadata injector not available or output file missing.")
-                return
-            cmd = [
-                sys.executable,
-                str(spatial_media_path),
-                "inject",
-                str(self.output_file),
-            ]
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp_path = tmp.name
+            metadata_utils.inject_mpeg4(
+                str(self.output_file), tmp_path, metadata, lambda x: None
             )
-            process.communicate(input="y\ny\ny\n")
-            if process.returncode == 0:
-                print("Successfully injected VR metadata.")
+            os.replace(tmp_path, str(self.output_file))
+            print("Successfully injected VR metadata.")
         except Exception as e:
             print(f"Error injecting metadata: {e}")
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def convert(self):
         video_info = self._get_video_info()
